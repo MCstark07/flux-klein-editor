@@ -1,0 +1,7 @@
+python_embeded/
+ComfyUI/
+__pycache__/
+*.pyc
+*.png
+*.jpg
+.env
