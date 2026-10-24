@@ -1,0 +1,7 @@
+gradio>=4.0.0
+pywebview>=5.0
+websocket-client
+requests
+pillow
+numpy
+huggingface_hub
