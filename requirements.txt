@@ -4,4 +4,4 @@ websocket-client
 requests
 pillow
 numpy
-huggingface_hub
+huggingface_hub<2.0

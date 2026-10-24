@@ -13,13 +13,27 @@ import gradio as gr
 
 COMFY_HOST = "127.0.0.1:8188"
 
-# workflow_api.json node IDs (Update these if your JSON uses different numbers)
-NODE_LOAD_IMAGE = "10"
-NODE_PROMPT = "6"
-NODE_KSAMPLER = "3"
-NODE_SAVE_IMAGE = "9"
+# Exact Node IDs mapped from your Flux.2 Klein 4B workflow_api.json
+NODE_LOAD_IMAGE = "20"
+NODE_PROMPT = "19"
+NODE_SEED = "7"
+NODE_SCHEDULER = "11"
+NODE_SAVE_IMAGE = "1"
+LORA_NODES = ["16", "17", "18"]
 
 comfy_proc = None
+
+def get_available_loras():
+    lora_dir = os.path.join("ComfyUI", "models", "loras")
+    if not os.path.exists(lora_dir):
+        return ["None"]
+    files = []
+    for root, _, filenames in os.walk(lora_dir):
+        for f in filenames:
+            if f.endswith((".safetensors", ".pt", ".ckpt")):
+                rel = os.path.relpath(os.path.join(root, f), lora_dir)
+                files.append(rel)
+    return ["None"] + sorted(files)
 
 def boot_comfy():
     global comfy_proc
@@ -49,14 +63,17 @@ def boot_comfy():
 
 def build_mask_image(editor_data):
     if not editor_data or editor_data.get("background") is None:
-        raise gr.Error("No image uploaded.")
+        raise gr.Error("Please upload an image first.")
 
     base = Image.fromarray(editor_data["background"]).convert("RGBA")
     layers = editor_data.get("layers", [])
     if not layers:
-        raise gr.Error("Draw a mask over the area you want to edit first.")
+        raise gr.Error("Please paint a mask over the area you want to edit.")
 
     mask_alpha = np.array(layers[0])[:, :, 3] > 10
+    if not np.any(mask_alpha):
+        raise gr.Error("Please paint a mask over the area you want to edit.")
+
     rgba = np.array(base)
     rgba[:, :, 3] = np.where(mask_alpha, 0, 255)
 
@@ -64,8 +81,34 @@ def build_mask_image(editor_data):
     Image.fromarray(rgba).save(out_path)
     return out_path
 
-def generate(editor_data, prompt, denoise, progress=gr.Progress()):
-    progress(0.1, desc="Preparing mask...")
+def apply_optional_loras(wf, user_loras):
+    # user_loras is a list of (lora_name, strength) tuples
+    all_loras = [x for x in get_available_loras() if x != "None"]
+    fallback_lora = all_loras[0] if all_loras else None
+
+    for idx, node_id in enumerate(LORA_NODES):
+        if node_id not in wf:
+            continue
+        inputs = wf[node_id]["inputs"]
+        chosen_name, chosen_str = user_loras[idx] if idx < len(user_loras) else ("None", 0.0)
+
+        if chosen_name != "None" and float(chosen_str) != 0.0:
+            inputs["lora_name"] = chosen_name
+            inputs["strength_model"] = float(chosen_str)
+            inputs["strength_clip"] = float(chosen_str)
+        else:
+            # Zero out strength so ComfyUI skips applying the LoRA
+            inputs["strength_model"] = 0.0
+            inputs["strength_clip"] = 0.0
+            if fallback_lora and not os.path.exists(os.path.join("ComfyUI", "models", "loras", inputs.get("lora_name", ""))):
+                inputs["lora_name"] = fallback_lora
+
+    # Remove unconnected dead nodes if present so missing files never error out
+    if "14" in wf and "model" not in wf["14"].get("inputs", {}):
+        del wf["14"]
+
+def generate(editor_data, prompt, denoise, steps, l1_name, l1_str, l2_name, l2_str, progress=gr.Progress()):
+    progress(0.05, desc="Preparing image & mask...")
     img_path = build_mask_image(editor_data)
 
     with open(img_path, "rb") as f:
@@ -80,30 +123,33 @@ def generate(editor_data, prompt, denoise, progress=gr.Progress()):
 
     wf[NODE_LOAD_IMAGE]["inputs"]["image"] = resp["name"]
     wf[NODE_PROMPT]["inputs"]["text"] = prompt
+    wf[NODE_SCHEDULER]["inputs"]["denoise"] = float(denoise)
+    wf[NODE_SCHEDULER]["inputs"]["steps"] = int(steps)
+    wf[NODE_SEED]["inputs"]["noise_seed"] = int.from_bytes(os.urandom(4), "big")
 
-    sampler_in = wf[NODE_KSAMPLER]["inputs"]
-    if "denoise" in sampler_in:
-        sampler_in["denoise"] = float(denoise)
-
-    seed_key = "noise_seed" if "noise_seed" in sampler_in else "seed"
-    if seed_key in sampler_in:
-        sampler_in[seed_key] = int.from_bytes(os.urandom(4), "big")
+    apply_optional_loras(wf, [(l1_name, l1_str), (l2_name, l2_str), ("None", 0.0)])
 
     client_id = str(uuid.uuid4())
     ws = websocket.WebSocket()
     ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}")
 
-    prompt_id = requests.post(
+    post_resp = requests.post(
         f"http://{COMFY_HOST}/prompt",
         json={"prompt": wf, "client_id": client_id},
-    ).json()["prompt_id"]
+    ).json()
 
-    progress(0.2, desc="Sampling...")
+    if "error" in post_resp or "node_errors" in post_resp and post_resp["node_errors"]:
+        ws.close()
+        raise gr.Error(f"ComfyUI Workflow Error: {json.dumps(post_resp)}")
+
+    prompt_id = post_resp["prompt_id"]
+
+    progress(0.15, desc="Running Flux.2 Klein 4B...")
     while True:
         msg = json.loads(ws.recv())
         if msg["type"] == "progress":
             val, total = msg["data"]["value"], msg["data"]["max"]
-            progress(0.2 + 0.75 * (val / total), desc=f"Step {val}/{total}")
+            progress(0.15 + 0.80 * (val / total), desc=f"Sampling step {val}/{total}")
         elif msg["type"] == "executing":
             if msg["data"]["node"] is None and msg["data"]["prompt_id"] == prompt_id:
                 break
@@ -120,32 +166,53 @@ def generate(editor_data, prompt, denoise, progress=gr.Progress()):
 
     return Image.open("output.png")
 
-with gr.Blocks(title="Flux Klein Inpaint") as app:
-    gr.Markdown("### Flux.2 Klein 4B Inpaint Studio")
+lora_choices = get_available_loras()
+
+with gr.Blocks(title="Flux.2 Klein 4B Inpaint Studio") as app:
+    gr.Markdown("## Flux.2 Klein 4B Inpaint Studio")
     with gr.Row():
-        with gr.Column():
+        with gr.Column(scale=1):
             editor = gr.ImageEditor(
-                label="Input Image & Mask",
+                label="1. Upload Image & Paint Mask",
                 type="numpy",
-                brush=gr.Brush(colors=["#FFFFFF"], color_mode="fixed", default_size=40),
-                eraser=gr.Eraser(default_size=40),
-                height=500,
+                brush=gr.Brush(colors=["#FFFFFF"], color_mode="fixed", default_size=45),
+                eraser=gr.Eraser(default_size=45),
+                height=520,
             )
-            prompt_in = gr.Textbox(label="Prompt", placeholder="Describe the edit...")
-            denoise_in = gr.Slider(0.1, 1.0, value=0.85, step=0.05, label="Denoise Strength")
-            submit_btn = gr.Button("Generate", variant="primary")
+            prompt_in = gr.Textbox(
+                label="2. Edit Prompt",
+                placeholder="Describe what should appear in the masked area...",
+            )
+            with gr.Row():
+                denoise_in = gr.Slider(0.1, 1.0, value=0.85, step=0.05, label="Denoise Strength")
+                steps_in = gr.Slider(4, 30, value=8, step=1, label="Steps")
 
-        with gr.Column():
-            output_img = gr.Image(label="Output", height=500)
+            with gr.Accordion("Advanced: Optional LoRAs (Click to expand)", open=False):
+                gr.Markdown("*Leave set to **None** for standard generation.*")
+                with gr.Row():
+                    lora1_name = gr.Dropdown(choices=lora_choices, value="None", label="LoRA Slot 1")
+                    lora1_str = gr.Slider(-2.0, 2.0, value=1.0, step=0.05, label="Slot 1 Strength")
+                with gr.Row():
+                    lora2_name = gr.Dropdown(choices=lora_choices, value="None", label="LoRA Slot 2")
+                    lora2_str = gr.Slider(-2.0, 2.0, value=1.0, step=0.05, label="Slot 2 Strength")
 
-    submit_btn.click(generate, [editor, prompt_in, denoise_in], [output_img])
+            submit_btn = gr.Button("Generate Edit", variant="primary", size="lg")
+
+        with gr.Column(scale=1):
+            output_img = gr.Image(label="Edited Result", height=520)
+
+    submit_btn.click(
+        generate,
+        [editor, prompt_in, denoise_in, steps_in, lora1_name, lora1_str, lora2_name, lora2_str],
+        [output_img],
+    )
 
 if __name__ == "__main__":
     boot_comfy()
     _, url, _ = app.launch(prevent_thread_lock=True, quiet=True)
     try:
         import webview
-        webview.create_window("Flux Klein Inpaint", url, width=1240, height=840)
+        webview.create_window("Flux.2 Klein 4B Inpaint Studio", url, width=1280, height=860)
         webview.start()
     except Exception:
         webbrowser.open(url)
